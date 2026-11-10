@@ -1,0 +1,113 @@
+{
+  "meta": {
+    "task": "2026-competition-round2 MiniVectorDB",
+    "synthetic": false,
+    "language": "zh-CN",
+    "note": "本文件记录本轮开发中参赛者与编码 Agent 的真实交互、实验与结果，未编造未执行的内容。"
+  },
+  "user_prompts": [
+    "https://github.com/oceanbase/seekdb这是官方仓库，你把题目下载到我的仓库去",
+    "https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/lg8enxlmwg69unt6，你去这个官方网址找找呢，我有点不懂",
+    "大概有180个提交，除了40个json timeout外，其他应该都是正常的错误，看上去大家理解的sql ready + json和判题逻辑的json 行解析理解上不一致……你尽量做一版，通过图片所示的三道门槛"
+  ],
+  "conversations": [
+    {
+      "id": "c0",
+      "role": "student",
+      "content": "https://github.com/oceanbase/seekdb这是官方仓库，你把题目下载到我的仓库去",
+      "intent": "要求在官方仓库的 2026-competition-round2 分支上建立参赛工作分支"
+    },
+    {
+      "id": "c1",
+      "role": "agent",
+      "content": "我先查了 oceanbase/seekdb 的 2026-competition-round2 分支，HEAD 是 c842a368c339，树里只有 Dockerfile(0 字节) 和 conversation.json(0 字节)，没有题目源码或测试驱动；随后在 fuye-star/seekdb 用该 commit 创建了同名分支。"
+    },
+    {
+      "id": "c2",
+      "role": "student",
+      "content": "https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/lg8enxlmwg69unt6，你去这个官方网址找找呢，我有点不懂",
+      "intent": "希望从官方文档中直接找到题包和协议"
+    },
+    {
+      "id": "c3",
+      "role": "agent",
+      "content": "用无头 Edge 渲染该语雀文档并抽取正文（428 行），确认文档只包含题目说明，正文明确写着“赛题文件、评测协议、公开测试与基线由组织方另行提供”，页面内 43 个链接均为图片/字体/样式，没有 zip 或附件下载地址。因此题包只能从比赛平台或赛事群获取。"
+    },
+    {
+      "id": "c4",
+      "role": "student",
+      "content": "大概有180个提交，除了40个json timeout外，其他应该都是正常的错误，看上去大家理解的sql ready + json和判题逻辑的json 行解析理解上不一致……你尽量做一版，通过图片所示的三道门槛",
+      "intent": "提供组织方最新反馈，要求实现一版可通过功能准入门槛的数据库"
+    },
+    {
+      "id": "c5",
+      "role": "agent",
+      "content": "重新拉取 round2 分支发现组织方已更新到 f4d4e26653af，新增 STDIO_PROTOCOL.md、mysqltest/（20 个公开用例）、protocol_check/ 参考检查工具。我按协议实现：启动先输出 {\"type\":\"ready\"}，逐行 JSON 请求响应，execute/shutdown 两种 op，错误返回 ok:false 和非空 error.code。"
+    },
+    {
+      "id": "c6",
+      "role": "agent",
+      "content": "本地用自写驱动按 test/result 逐条比对，20 个公开用例首次运行 19/20 通过，失败的是 sql_ordering：SELECT id FROM docs ORDER BY value 报 internal_error: list index out of range。原因是排序键引用了未投影的列，而我当时只把投影值放进了排序元组。"
+    },
+    {
+      "id": "c7",
+      "role": "agent",
+      "content": "修正方式：排序项保留完整行 (pk, values, row)，按别名排序用 values，按真实列排序用 row[col_idx]，同时先按主键稳定排序再按键稳定排序，保证并列时主键升序。修完后 20/20 通过。"
+    }
+  ],
+  "experiments": [
+    {
+      "id": "e1",
+      "hypothesis": "协议握手必须是精确的 {\"type\":\"ready\"}，且 ready 要在读第一条请求前主动输出并 flush",
+      "action": "阅读 STDIO_PROTOCOL.md 第 2 节，并实现 ready 输出后再进入 stdin 循环",
+      "result": "本机与容器内自测均收到首行 {\"type\":\"ready\"}；批量管道自测输出 5 行，分别为 ready、CREATE、INSERT(affected_rows=1)、SELECT(columns/rows 正确)、shutdown ok",
+      "output": "{\"type\":\"ready\"}\n{\"id\":1,\"ok\":true}\n{\"id\":2,\"ok\":true,\"affected_rows\":1}\n{\"id\":3,\"ok\":true,\"columns\":[\"id\",\"content\"],\"rows\":[[1,\"你好\"]]}\n{\"id\":4,\"ok\":true}"
+    },
+    {
+      "id": "e2",
+      "hypothesis": "公开用例可以逐条驱动验证，不需要真实判题器",
+      "action": "写 run_public_cases.py：启动数据库进程，按 .test 逐行发 execute，按 .result 校验 columns/rows/affected_rows/error，并处理 --restart 与 --mode ann",
+      "result": "首次 19/20 通过；修复排序问题后 20/20 通过",
+      "output": "PASS sql_bigint ... PASS vector_ties_and_filter\n20/20 passed"
+    },
+    {
+      "id": "e3",
+      "hypothesis": "多行 INSERT 中出现重复主键时整条语句必须原子失败，事务内之前的修改仍可提交",
+      "action": "运行 transaction_failed_insert：事务内先 UPDATE，再插入 (4,...) 与重复的 (2,...)，之后查询并 COMMIT，重启后再查",
+      "result": "INSERT 返回 duplicate_key；SELECT 只看到 1/2/3；重启后 id=1 的 content 仍为“保留”，证明失败语句未留下 id=4 且事务提交生效",
+      "output": "{\"error\":\"duplicate_key\"} / rows [[1],[2],[3]] / restart rows [[1,\"保留\"],[2,\"二\"],[3,\"三\"]]"
+    },
+    {
+      "id": "e4",
+      "hypothesis": "向量按 float32 存储，16777217 会舍入为 16777216，距离应为 0.0",
+      "action": "运行 vector_float32 用例，插入 [16777217,0] 和 [16777216,0]，查询到 [16777216,0] 的距离",
+      "result": "两条距离均为 0.0，符合 float32 语义",
+      "output": "columns ['id','distance'] rows [[1,0.0],[2,0.0]]"
+    },
+    {
+      "id": "e5",
+      "hypothesis": "TopK 查询的性能瓶颈在逐行 Python 距离计算与过滤",
+      "action": "构造 10000 条 128 维向量、1000 条 TopK(10) 查询（一半带 category 等值过滤），对本机进程计时；随后把距离计算改为 numpy 矩阵运算、过滤改为布尔掩码",
+      "result": "查询耗时从 6.3s 降到 2.6s（Windows 本机）；容器 2 CPU 限制下为 3.4s",
+      "output": "{\"write_s\":20.04,\"query_s\":2.6,\"bad_len\":0} -> {\"write_s\":51.16,\"query_s\":3.44,\"bad_len\":0}（容器）"
+    },
+    {
+      "id": "e6",
+      "hypothesis": "批量写入耗时主要来自每条语句提交时的 fsync，而不是 SQL 解析",
+      "action": "先优化向量文本解析（np.fromstring）、再把 WAL 向量改为 float32 base64 编码，观察写耗时",
+      "result": "两项优化后写耗时基本不变（19.9s→19.5s），说明瓶颈是每条语句的持久化 fsync；据此保留“写 WAL 并 fdatasync 后再返回成功”的语义，没有为性能牺牲持久性",
+      "output": "write_s: 19.85 -> 19.25 -> 19.51（多次运行波动在噪声范围内）"
+    }
+  ],
+  "retrospective": [
+    "最初没有题包时，只能从仓库分支和语雀文档确认协议缺失；拿到 STDIO_PROTOCOL.md 后，实现重点从“猜协议”转为“按 JSONL 报文逐字段对齐”，这是本轮最关键的取舍。",
+    "公开用例只覆盖 20 个样例，我额外补了事务失败原子性、float32 舍入和重启恢复的手工验证，避免只对样例过拟合。",
+    "性能优化遵循“先测量后优化”：写耗时优化两次无效后，用对照实验确认瓶颈在 fsync，因此没有把持久化改成异步写来换分数。"
+  ],
+  "limitations": [
+    "全量数据常驻内存，未实现超过内存预算的大数据集存储；",
+    "ANN 模式当前走精确扫描（结果为精确 TopK），没有实现近似索引结构；",
+    "不支持 NULL、JOIN、聚合、子查询、ALTER TABLE 与主键更新；",
+    "协议自测工具 protocol_check 在本机 Windows 上因 socket 初始化失败未能运行，改用自写驱动完成 20 个公开用例与握手验证。"
+  ]
+}

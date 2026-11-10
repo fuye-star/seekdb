@@ -533,13 +533,13 @@ class Parser:
         if self.accept("id", "order"):
             self.expect("id", "by")
             while True:
-                name = self.ident()
+                expr = self.parse_expr()
                 desc = False
                 if self.accept("id", "desc"):
                     desc = True
                 else:
                     self.accept("id", "asc")
-                order.append((name, desc))
+                order.append({"expr": expr, "desc": desc})
                 if self.accept("op", ","):
                     continue
                 break
@@ -825,32 +825,35 @@ class Engine:
         return names, exprs
 
     def _fast_topk(self, stmt, table):
-        """Vectorised path for `ORDER BY <distance> LIMIT k` queries."""
+        """Vectorised path for `ORDER BY <distance or its alias> LIMIT k`."""
         if self.db.tx is not None or stmt["limit"] is None:
             return None
-        if len(stmt["order"]) != 1 or stmt["order"][0][1]:
+        order = stmt["order"]
+        if len(order) != 1 or order[0]["desc"]:
             return None
         if any(p["kind"] == "star" for p in stmt["projections"]):
             return None
         names, exprs = self._project(table, stmt["projections"])
-        order_name = stmt["order"][0][0]
-        if order_name not in names:
+        order_expr = order[0]["expr"]
+        dist_expr = None
+        if order_expr["type"] == "distance":
+            dist_expr = order_expr
+        elif order_expr["type"] == "column":
+            for i, expr in enumerate(exprs):
+                if expr["type"] == "distance" and names[i].lower() == order_expr["name"].lower():
+                    dist_expr = expr
+                    break
+            if dist_expr is None:
+                return None
+        else:
             return None
-        dist_pos = None
-        for i, expr in enumerate(exprs):
-            if expr["type"] == "distance":
-                dist_pos = i
-                break
-        if dist_pos is None or names[dist_pos] != order_name:
-            return None
-        vector_idx = table.column_index(exprs[dist_pos]["column"])
+        vector_idx = table.column_index(dist_expr["column"])
         if vector_idx is None or table.columns[vector_idx].kind != "VECTOR":
             return None
-        query = self._coerce(table, vector_idx, exprs[dist_pos]["vector"])
+        query = self._coerce(table, vector_idx, dist_expr["vector"])
         ids, mat = table.matrix()
         if len(ids) == 0:
             return {"columns": names, "rows": []}
-        keep_arr = None
         where = stmt["where"]
         simple = True
         for cond in where or []:
@@ -875,15 +878,17 @@ class Engine:
             return {"columns": names, "rows": []}
         diff = mat[keep_arr] - query
         dists = np.sqrt((diff * diff).sum(axis=1, dtype=np.float32))
-        order = np.lexsort((ids[keep_arr], dists))[: stmt["limit"]]
+        order_idx = np.lexsort((ids[keep_arr], dists))[: stmt["limit"]]
         out_rows = []
-        for idx in order:
+        for idx in order_idx:
             pk = int(ids[keep_arr[idx]])
             row = table.rows[pk]
             values = []
-            for j, expr in enumerate(exprs):
-                if j == dist_pos:
-                    values.append(float(dists[idx]))
+            for expr in exprs:
+                if expr["type"] == "distance":
+                    vi = table.column_index(expr["column"])
+                    qv = self._coerce(table, vi, expr["vector"])
+                    values.append(self._distance(row[vi], qv))
                 elif expr["type"] == "column":
                     values.append(row[table.column_index(expr["name"])])
                 else:
@@ -931,19 +936,32 @@ class Engine:
 
         order = stmt["order"]
         computed.sort(key=lambda item: item[0])
-        for name, desc in reversed(order):
-            key_idx = names.index(name) if name in names else None
-            if key_idx is None:
-                col_idx = table.column_index(name)
-                if col_idx is None:
-                    raise SQLError("column_not_found", f"unknown order column {name}")
+        for item in reversed(order):
+            expr = item["expr"]
+            desc = item["desc"]
+            if expr["type"] == "distance":
+                vi = table.column_index(expr["column"])
+                if vi is None:
+                    raise SQLError("column_not_found", f"unknown column {expr['column']}")
+                qv = self._coerce(table, vi, expr["vector"])
 
-                def keyfn(item, col_idx=col_idx):
-                    return item[2][col_idx]
-            else:
-                def keyfn(item, key_idx=key_idx):
-                    value = item[1][key_idx]
+                def keyfn(rowitem, vi=vi, qv=qv):
+                    return self._distance(rowitem[2][vi], qv)
+            elif expr["type"] == "column" and expr["name"] in names:
+                key_idx = names.index(expr["name"])
+
+                def keyfn(rowitem, key_idx=key_idx):
+                    value = rowitem[1][key_idx]
                     return value[0] if isinstance(value, tuple) else value
+            elif expr["type"] == "column":
+                col_idx = table.column_index(expr["name"])
+                if col_idx is None:
+                    raise SQLError("column_not_found", f"unknown order column {expr['name']}")
+
+                def keyfn(rowitem, col_idx=col_idx):
+                    return rowitem[2][col_idx]
+            else:
+                raise SQLError("unsupported", "unsupported ORDER BY expression")
             computed.sort(key=keyfn, reverse=desc)
 
         if stmt["limit"] is not None:
@@ -999,8 +1017,17 @@ def emit(obj):
 
 
 def main():
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
     db = Database()
-    db.load()
+    try:
+        db.load()
+    except Exception as exc:  # noqa: BLE001
+        log("recovery failed, starting from empty state:", repr(exc))
+        db = Database()
     engine = Engine(db)
     emit({"type": "ready"})
     for line in sys.stdin:
@@ -1012,32 +1039,37 @@ def main():
         except json.JSONDecodeError:
             log("invalid request line", line[:200])
             continue
-        rid = request.get("id")
-        op = request.get("op")
-        if op == "shutdown":
-            if db.tx is not None:
-                db.tx = None
-            try:
-                db.snapshot()
-            except Exception as exc:  # noqa: BLE001
-                log("snapshot failed", exc)
-            emit({"id": rid, "ok": True})
-            return 0
-        if op != "execute":
-            emit({"id": rid, "ok": False, "error": {"code": "unsupported_op", "message": "unsupported op"}})
-            continue
-        sql = request.get("sql", "")
-        mode = request.get("search_mode", "exact")
         try:
+            rid = request.get("id")
+            op = request.get("op")
+            if op == "shutdown":
+                if db.tx is not None:
+                    db.tx = None
+                try:
+                    db.snapshot()
+                except Exception as exc:  # noqa: BLE001
+                    log("snapshot failed", exc)
+                emit({"id": rid, "ok": True})
+                return 0
+            if op != "execute":
+                emit({"id": rid, "ok": False, "error": {"code": "unsupported_op", "message": "unsupported op"}})
+                continue
+            sql = request.get("sql", "")
+            mode = request.get("search_mode", "exact")
             result = engine.execute(sql, mode)
             response = {"id": rid, "ok": True}
             response.update(result)
             emit(response)
         except SQLError as exc:
             emit({"id": rid, "ok": False, "error": {"code": exc.code, "message": exc.message}})
+        except MemoryError:
+            emit({"id": rid, "ok": False, "error": {"code": "out_of_memory", "message": "out of memory"}})
         except Exception as exc:  # noqa: BLE001
             log("internal error", repr(exc))
-            emit({"id": rid, "ok": False, "error": {"code": "internal_error", "message": str(exc)}})
+            try:
+                emit({"id": rid, "ok": False, "error": {"code": "internal_error", "message": str(exc)}})
+            except Exception:  # noqa: BLE001
+                pass
     return 0
 
 

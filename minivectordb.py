@@ -1095,12 +1095,20 @@ class Engine:
             keep_arr = np.asarray(keep, dtype=np.int64)
         if len(keep_arr) == 0:
             return {"columns": names, "rows": []}
-        diff = mat[keep_arr] - query
-        dists = np.sqrt((diff * diff).sum(axis=1, dtype=np.float32))
-        order_idx = np.lexsort((ids[keep_arr], dists))[: stmt["limit"]]
+        diff = mat - query
+        d2 = (diff * diff).sum(axis=1, dtype=np.float32)
+        cand_ids = ids[keep_arr]
+        cand_d2 = d2[keep_arr]
+        k = min(stmt["limit"], len(cand_ids))
+        if k < len(cand_ids) // 4:
+            part = np.argpartition(cand_d2, k - 1)[:k]
+        else:
+            part = np.arange(len(cand_ids))
+        order_idx = part[np.lexsort((cand_ids[part], cand_d2[part]))][:k]
+        dists = np.sqrt(cand_d2[order_idx])
         out_rows = []
-        for idx in order_idx:
-            pk = int(ids[keep_arr[idx]])
+        for pos, idx in enumerate(order_idx):
+            pk = int(cand_ids[idx])
             row = table.rows[pk]
             values = []
             for expr in exprs:

@@ -315,14 +315,20 @@ def tokenize(sql):
     return tokens
 
 
-INSERT_HEAD = re.compile(r"(?is)^\s*insert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\s+values\s+(.*?)[;\s]*$")
+INSERT_HEAD = re.compile(
+    r"(?is)^\s*insert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s+values\s+(.*?)[;\s]*$"
+)
 
 
 def fast_insert(sql):
     m = INSERT_HEAD.match(sql)
     if not m:
         return None
-    table, body = m.group(1), m.group(2)
+    table, column_list, body = m.group(1), m.group(2), m.group(3)
+    if column_list:
+        # Column-list inserts are handled by the full parser below.
+        return None
+    columns = None
     rows = []
     i, n = 0, len(body)
     while i < n:
@@ -375,7 +381,7 @@ def fast_insert(sql):
                 break
             return None
         rows.append(values)
-    return {"kind": "insert", "table": table, "rows": rows}
+    return {"kind": "insert", "table": table, "rows": rows, "columns": columns}
 
 
 class Parser:
@@ -485,6 +491,15 @@ class Parser:
         self.expect("id", "insert")
         self.expect("id", "into")
         table = self.ident()
+        columns = None
+        if self.accept("op", "("):
+            columns = []
+            while True:
+                columns.append(self.ident())
+                if self.accept("op", ","):
+                    continue
+                break
+            self.expect("op", ")")
         self.expect("id", "values")
         rows = []
         while True:
@@ -501,7 +516,7 @@ class Parser:
                 continue
             break
         self.accept("op", ";")
-        return {"kind": "insert", "table": table, "rows": rows}
+        return {"kind": "insert", "table": table, "rows": rows, "columns": columns}
 
     def parse_literal(self):
         k, v = self.next()
@@ -791,11 +806,29 @@ class Engine:
 
     def insert(self, stmt):
         table = self.table(stmt["table"])
-        if len(table.columns) != len(stmt["rows"][0]):
-            raise SQLError("type_error", "column count mismatch")
+        column_names = stmt.get("columns")
+        column_idx = None
+        if column_names:
+            column_idx = []
+            for name in column_names:
+                idx = table.column_index(name)
+                if idx is None:
+                    raise SQLError("column_not_found", f"unknown column {name}")
+                if idx in column_idx:
+                    raise SQLError("type_error", "duplicate column in insert list")
+                column_idx.append(idx)
         prepared = []
         seen = set()
         for raw in stmt["rows"]:
+            if column_idx is not None:
+                if len(raw) != len(column_idx):
+                    raise SQLError("type_error", "column count mismatch")
+                full = [None] * len(table.columns)
+                for idx, value in zip(column_idx, raw):
+                    full[idx] = value
+                if any(value is None for value in full):
+                    raise SQLError("type_error", "missing column value")
+                raw = full
             if len(raw) != len(table.columns):
                 raise SQLError("type_error", "column count mismatch")
             row = [self._coerce(table, i, v) for i, v in enumerate(raw)]
@@ -827,6 +860,9 @@ class Engine:
     def _fast_topk(self, stmt, table):
         """Vectorised path for `ORDER BY <distance or its alias> LIMIT k`."""
         if self.db.tx is not None or stmt["limit"] is None:
+            return None
+        if len(table.rows) > 200000:
+            # Avoid materialising a second full copy of a large vector set.
             return None
         order = stmt["order"]
         if len(order) != 1 or order[0]["desc"]:
@@ -992,12 +1028,17 @@ class Engine:
             if expr["type"] != "literal":
                 raise SQLError("unsupported", "only literal assignments supported")
             assignments.append((idx, expr["value"]))
+        # Validate every target row before applying anything so a failing
+        # statement cannot leave partial modifications behind.
+        pending = []
         for pk, row in targets:
             new_row = list(row)
             for idx, value in assignments:
                 new_row[idx] = self._coerce(table, idx, value)
+            pending.append((pk, new_row))
+        for pk, new_row in pending:
             self.db._write_row(table.name, pk, new_row)
-        return {"affected_rows": len(targets)}
+        return {"affected_rows": len(pending)}
 
     def delete(self, stmt):
         table = self.table(stmt["table"])

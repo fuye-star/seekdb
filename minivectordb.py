@@ -258,12 +258,12 @@ class Database:
 
     def rollback(self):
         if self.tx is None:
-            raise SQLError("no_transaction", "no active transaction")
+            return
         self.tx = None
 
     def commit(self):
         if self.tx is None:
-            raise SQLError("no_transaction", "no active transaction")
+            return
         tx = self.tx
         self.tx = None
         self.commit_ops(tx["ops"])
@@ -678,9 +678,14 @@ class Parser:
         limit = None
         offset = None
         if self.accept("id", "limit"):
-            limit = int(self.next()[1])
-            if self.accept("id", "offset"):
-                offset = int(self.next()[1])
+            first = int(self.next()[1])
+            if self.accept("op", ","):
+                offset = first
+                limit = int(self.next()[1])
+            else:
+                limit = first
+                if self.accept("id", "offset"):
+                    offset = int(self.next()[1])
         self.accept("op", ";")
         return {"kind": "select", "table": table, "projections": projections,
                 "where": where, "order": order, "limit": limit, "offset": offset}
@@ -1110,8 +1115,46 @@ class Engine:
             out_rows.append(values)
         return {"columns": names, "rows": out_rows}
 
+    def _validate_select(self, stmt, table):
+        names, exprs = self._project(table, stmt["projections"])
+        if exprs is None:
+            exprs = [{"type": "column", "name": col.name} for col in table.columns]
+        for expr in exprs:
+            if expr["type"] == "column":
+                if table.column_index(expr["name"]) is None:
+                    raise SQLError("column_not_found", f"unknown column {expr['name']}")
+            elif expr["type"] == "distance":
+                idx = table.column_index(expr["column"])
+                if idx is None:
+                    raise SQLError("column_not_found", f"unknown column {expr['column']}")
+                if table.columns[idx].kind != "VECTOR":
+                    raise SQLError("type_error", "L2_DISTANCE requires a vector column")
+        for cond in stmt["where"] or []:
+            if "distance" in cond:
+                expr = cond["distance"]
+                idx = table.column_index(expr["column"])
+                if idx is None:
+                    raise SQLError("column_not_found", f"unknown column {expr['column']}")
+                if table.columns[idx].kind != "VECTOR":
+                    raise SQLError("type_error", "L2_DISTANCE requires a vector column")
+            elif table.column_index(cond["column"]) is None:
+                raise SQLError("column_not_found", f"unknown column {cond['column']}")
+        for item in stmt["order"]:
+            expr = item["expr"]
+            if expr["type"] == "distance":
+                idx = table.column_index(expr["column"])
+                if idx is None:
+                    raise SQLError("column_not_found", f"unknown column {expr['column']}")
+                if table.columns[idx].kind != "VECTOR":
+                    raise SQLError("type_error", "L2_DISTANCE requires a vector column")
+            elif expr["type"] == "column":
+                if expr["name"] not in names and table.column_index(expr["name"]) is None:
+                    raise SQLError("column_not_found", f"unknown column {expr['name']}")
+        return names, exprs
+
     def select(self, stmt):
         table = self.table(stmt["table"])
+        self._validate_select(stmt, table)
         fast = self._fast_topk(stmt, table)
         if fast is not None:
             return fast

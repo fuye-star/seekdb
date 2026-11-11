@@ -11,7 +11,7 @@ import base64
 
 import numpy as np
 
-DATA_DIR = os.environ.get("MVDB_DATA", "/data")
+DATA_DIR = os.environ.get("VECTORDB_DATA_DIR") or os.environ.get("MVDB_DATA") or "/data"
 DATA_DIR = os.path.abspath(DATA_DIR)
 SNAPSHOT = os.path.join(DATA_DIR, "snapshot.json")
 WAL = os.path.join(DATA_DIR, "wal.log")

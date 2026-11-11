@@ -111,10 +111,10 @@
     },
     {
       "id": "e6",
-      "hypothesis": "TopK 查询的耗时主要来自逐行 Python 距离计算与过滤",
-      "action": "构造 10000 条 128 维向量、1000 条 TopK(10) 查询（一半带等值过滤），先改为 numpy 矩阵运算与布尔掩码，再改为平方距离 + argpartition 只对候选排序",
-      "result": "查询耗时从 6.3s 降到 2.9s（Linux 容器 2 CPU 限制下）",
-      "output": "{\"write_s\":51.27,\"query_s\":2.9,\"bad_len\":0}"
+      "hypothesis": "TopK 查询的耗时主要来自逐行 Python 距离计算与多线程 BLAS 争用",
+      "action": "构造 10000 条 128 维向量、1000 条 TopK(10) 查询（一半带等值过滤），先改为 numpy 矩阵运算与布尔掩码，再改为 ‖x‖²+‖q‖²-2x·q 的 BLAS 计算，最后在 2 CPU 容器里对比 BLAS 线程数的影响",
+      "result": "逐行计算 6.3s → 矩阵运算 2.9s → BLAS 距离 0.76s；发现容器内多线程 BLAS 反而退化到 10.31s，设置 OPENBLAS_NUM_THREADS=1 后降到 0.68s",
+      "output": "{\"query_s\": 2.9} -> {\"query_s\": 10.31}（多线程）-> {\"query_s\": 0.68}（单线程 BLAS）"
     },
     {
       "id": "e7",
@@ -122,6 +122,13 @@
       "action": "分别优化向量文本解析（np.fromstring）与 WAL 向量编码（float32 base64），观察写耗时变化",
       "result": "两项优化后写耗时基本不变（19.85s→19.51s），确认瓶颈是每条语句的持久化 fsync，因此没有为性能牺牲持久性",
       "output": "write_s: 19.85 -> 19.25 -> 19.51（多次运行波动在噪声范围内）"
+    },
+    {
+      "id": "e8",
+      "hypothesis": "写入慢是每条语句提交时的 fsync 造成的，而不是 SQL 解析或 WAL 编码",
+      "action": "在 2 CPU 容器里把数据目录放到 tmpfs（/dev/shm，避开真实 fsync），再与普通目录对比",
+      "result": "tmpfs 下写入 2.13s、查询 0.78s；普通容器目录下写入 51.9s，说明 CPU 侧写入开销只有约 2 秒，其余是 Docker Desktop 虚拟磁盘的 fsync 成本",
+      "output": "{\"write_s\":2.13,\"query_s\":0.78}（tmpfs） vs {\"write_s\":51.91,\"query_s\":0.76}（容器磁盘）"
     }
   ],
   "retrospective": [

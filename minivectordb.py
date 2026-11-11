@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """MiniVectorDB: single-process vector database speaking the round2 JSONL protocol."""
 
+import base64
 import json
 import math
 import os
 import re
 import sys
 
-import base64
+# Keep BLAS single-threaded: the judge grants two CPUs and per-query matvecs
+# are small, so thread pool contention dominates otherwise.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 
@@ -63,6 +68,7 @@ class Table:
         self._ids = np.empty(0, dtype=np.int64)
         self._mat = None
         self._col_cache = {}
+        self._norms = None
 
     @property
     def pk_name(self):
@@ -80,6 +86,13 @@ class Table:
     def invalidate(self):
         self._dirty = True
         self._col_cache.clear()
+        self._norms = None
+
+    def norms(self):
+        if self._norms is None:
+            _ids, mat = self.matrix()
+            self._norms = (mat * mat).sum(axis=1, dtype=np.float32)
+        return self._norms
 
     def column_array(self, index):
         cached = self._col_cache.get(index)
@@ -1095,8 +1108,9 @@ class Engine:
             keep_arr = np.asarray(keep, dtype=np.int64)
         if len(keep_arr) == 0:
             return {"columns": names, "rows": []}
-        diff = mat - query
-        d2 = (diff * diff).sum(axis=1, dtype=np.float32)
+        diff = None
+        d2 = table.norms() + float(np.dot(query, query)) - 2.0 * (mat @ query)
+        np.maximum(d2, 0.0, out=d2)
         cand_ids = ids[keep_arr]
         cand_d2 = d2[keep_arr]
         k = min(stmt["limit"], len(cand_ids))

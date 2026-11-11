@@ -314,7 +314,7 @@ class Database:
 # --------------------------------------------------------------------------
 TOKEN_RE = re.compile(r"\s*(?:(?P<num>-?\d+\.\d+|-?\d+)|(?P<str>'(?:[^']|'')*')|"
                       r"(?P<vec>\[[^\[\]]*\])|"
-                      r"(?P<id>[A-Za-z_][A-Za-z0-9_]*)|(?P<op><=|>=|<>|!=|=|<|>|\(|\)|,|;|\*))")
+                      r"(?P<id>[A-Za-z_][A-Za-z0-9_]*)|(?P<op><=|>=|<>|!=|=|<|>|\(|\)|,|;|\*|\.))")
 
 
 def tokenize(sql):
@@ -453,6 +453,12 @@ class Parser:
             raise SQLError("syntax_error", "expected identifier")
         return v
 
+    def qident(self):
+        parts = [self.ident()]
+        while self.accept("op", "."):
+            parts.append(self.ident())
+        return parts[-1]
+
     # -------- statements --------
     def parse(self):
         stmt = self._parse_one()
@@ -558,6 +564,8 @@ class Parser:
                         self.expect("op", "(")
                         size = int(self.next()[1])
                         self.expect("op", ")")
+                        if size <= 0:
+                            raise SQLError("syntax_error", "vector dimension must be positive")
                         col = Column(col_name, "VECTOR", size)
                     else:
                         raise SQLError("unsupported", f"unsupported type {kind_tok}")
@@ -576,6 +584,11 @@ class Parser:
                         break
             if pk_index is None:
                 raise SQLError("unsupported", "primary key required")
+            pk_col = columns[pk_index]
+            if pk_col.kind != "BIGINT":
+                raise SQLError("type_error", "primary key must be BIGINT")
+            if sum(1 for col in columns if col.kind == "VECTOR") > 1:
+                raise SQLError("unsupported", "at most one vector column per table")
             self.accept("op", ";")
             return {"kind": "create_table", "name": name, "columns": columns, "pk_index": pk_index,
                     "if_not_exists": if_not_exists}
@@ -673,25 +686,42 @@ class Parser:
                 "where": where, "order": order, "limit": limit, "offset": offset}
 
     def parse_expr(self):
+        k, v = self.peek()
+        if k == "id" and v.lower() == "l2_distance":
+            self.next()
+            self.expect("op", "(")
+            first = self.parse_distance_arg()
+            self.expect("op", ",")
+            second = self.parse_distance_arg()
+            self.expect("op", ")")
+            col = first if first["kind"] == "column" else second
+            vec = second if first["kind"] == "column" else first
+            if col["kind"] != "column" or vec["kind"] != "vector":
+                raise SQLError("type_error", "L2_DISTANCE expects (vector column, vector literal)")
+            return {"type": "distance", "column": col["name"], "vector": vec["value"]}
         k, v = self.next()
         if k == "id":
-            if v.lower() == "l2_distance":
-                self.expect("op", "(")
-                col = self.ident()
-                self.expect("op", ",")
-                vec = self.parse_vector_literal()
-                self.expect("op", ")")
-                return {"type": "distance", "column": col, "vector": vec}
-            return {"type": "column", "name": v}
+            if v.lower() == "null":
+                raise SQLError("unsupported", "NULL is not supported")
+            name = v
+            while self.accept("op", "."):
+                name = self.ident()
+            return {"type": "column", "name": name}
         if k in ("num", "str"):
             return {"type": "literal", "value": v}
         raise SQLError("syntax_error", "unexpected token in expression")
 
-    def parse_vector_literal(self):
-        k, v = self.next()
-        if k not in ("str", "vec"):
-            raise SQLError("syntax_error", "expected vector literal")
-        text = v.strip()
+    def parse_distance_arg(self):
+        k, v = self.peek()
+        if k in ("vec", "str"):
+            self.next()
+            return {"kind": "vector", "value": self._vec_list(v)}
+        if k == "id":
+            return {"kind": "column", "name": self.qident()}
+        raise SQLError("syntax_error", "expected vector column or vector literal")
+
+    def _vec_list(self, text):
+        text = text.strip()
         if not (text.startswith("[") and text.endswith("]")):
             raise SQLError("invalid_vector", "vector must be [..]")
         inner = text[1:-1].strip()
@@ -715,7 +745,17 @@ class Parser:
         return conds
 
     def parse_condition(self):
-        col = self.ident()
+        k, v = self.peek()
+        if k == "id" and v.lower() == "l2_distance":
+            expr = self.parse_expr()
+            k, op = self.next()
+            if k != "op" or op not in ("=", "<", "<=", ">", ">=", "!=", "<>"):
+                raise SQLError("syntax_error", "expected comparison operator")
+            k2, value = self.next()
+            if k2 != "num":
+                raise SQLError("syntax_error", "expected numeric literal")
+            return {"distance": expr, "op": op, "value": value}
+        col = self.qident()
         k, v = self.next()
         if k != "op" or v not in ("=", "<", "<=", ">", ">=", "!=", "<>"):
             raise SQLError("syntax_error", "expected comparison operator")
@@ -778,6 +818,8 @@ class Engine:
                     value = int(value)
                 else:
                     raise SQLError("type_error", f"column {col.name} expects BIGINT")
+            if value < -(2 ** 63) or value > 2 ** 63 - 1:
+                raise SQLError("value_out_of_range", f"value out of BIGINT range for {col.name}")
             return value
         if col.kind == "VARCHAR":
             if not isinstance(value, str):
@@ -831,14 +873,23 @@ class Engine:
         if not where:
             return True
         for cond in where:
-            idx = table.column_index(cond["column"])
-            if idx is None:
-                raise SQLError("column_not_found", f"unknown column {cond['column']}")
-            left = row[idx]
-            right = cond["value"]
             op = cond["op"]
-            if isinstance(left, np.ndarray):
-                raise SQLError("type_error", "cannot compare vector column")
+            right = cond["value"]
+            if "distance" in cond:
+                expr = cond["distance"]
+                idx = table.column_index(expr["column"])
+                if idx is None:
+                    raise SQLError("column_not_found", f"unknown column {expr['column']}")
+                if table.columns[idx].kind != "VECTOR":
+                    raise SQLError("type_error", "L2_DISTANCE requires a vector column")
+                left = self._distance(row[idx], np.asarray(expr["vector"], dtype=np.float32))
+            else:
+                idx = table.column_index(cond["column"])
+                if idx is None:
+                    raise SQLError("column_not_found", f"unknown column {cond['column']}")
+                left = row[idx]
+                if isinstance(left, np.ndarray):
+                    raise SQLError("type_error", "cannot compare vector column")
             if op == "=":
                 ok = left == right
             elif op == "!=" or op == "<>":
@@ -1017,6 +1068,9 @@ class Engine:
         where = stmt["where"]
         simple = True
         for cond in where or []:
+            if "distance" in cond:
+                simple = False
+                break
             idx = table.column_index(cond["column"])
             if idx is None or cond["op"] != "=" or table.columns[idx].kind == "VECTOR":
                 simple = False
@@ -1152,6 +1206,8 @@ class Engine:
             idx = table.column_index(col_name)
             if idx is None:
                 raise SQLError("column_not_found", f"unknown column {col_name}")
+            if idx == table.pk_index:
+                raise SQLError("unsupported", "primary key update is not supported")
             if expr["type"] != "literal":
                 raise SQLError("unsupported", "only literal assignments supported")
             assignments.append((idx, expr["value"]))

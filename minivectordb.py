@@ -127,14 +127,34 @@ class Database:
         os.makedirs(DATA_DIR, exist_ok=True)
         if os.path.exists(SNAPSHOT):
             with open(SNAPSHOT, "r", encoding="utf-8") as fh:
-                doc = json.load(fh)
-            for item in doc.get("tables", []):
-                cols = [Column(*c) for c in item["columns"]]
-                table = Table(item["name"], cols, item["pk_index"])
-                table.indexes = set(item.get("indexes", []))
-                for row in item["rows"]:
-                    table.rows[row[item["pk_index"]]] = self._decode_row(table, row)
-                self.tables[table.name] = table
+                first = fh.readline()
+                head = json.loads(first) if first.strip() else {}
+                if head.get("format") == "rows-v2":
+                    for item in head.get("tables", []):
+                        cols = [Column(*c) for c in item["columns"]]
+                        table = Table(item["name"], cols, item["pk_index"])
+                        table.indexes = set(item.get("indexes", []))
+                        self.tables[table.name] = table
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            break  # torn trailing write
+                        table = self.tables.get(rec["table"])
+                        if table is not None:
+                            table.rows[rec["pk"]] = self._decode_row(table, rec["row"])
+                else:
+                    doc = json.loads(first + fh.read())
+                    for item in doc.get("tables", []):
+                        cols = [Column(*c) for c in item["columns"]]
+                        table = Table(item["name"], cols, item["pk_index"])
+                        table.indexes = set(item.get("indexes", []))
+                        for row in item["rows"]:
+                            table.rows[row[item["pk_index"]]] = self._decode_row(table, row)
+                        self.tables[table.name] = table
         if os.path.exists(WAL):
             with open(WAL, "r", encoding="utf-8") as fh:
                 for line in fh:
@@ -157,25 +177,30 @@ class Database:
         return out
 
     def snapshot(self):
-        doc = {"tables": []}
-        for table in self.tables.values():
-            rows = []
-            for pk in sorted(table.rows):
-                row = table.rows[pk]
-                rows.append([enc_value(v) for v in row])
-            doc["tables"].append({
-                "name": table.name,
-                "columns": [[c.name, c.kind, c.size] for c in table.columns],
-                "pk_index": table.pk_index,
-                "indexes": sorted(table.indexes),
-                "rows": rows,
-            })
         tmp = SNAPSHOT + ".tmp"
         os.makedirs(DATA_DIR, exist_ok=True)
+        meta = {
+            "format": "rows-v2",
+            "tables": [
+                {
+                    "name": table.name,
+                    "columns": [[c.name, c.kind, c.size] for c in table.columns],
+                    "pk_index": table.pk_index,
+                    "indexes": sorted(table.indexes),
+                }
+                for table in self.tables.values()
+            ],
+        }
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh, ensure_ascii=False)
+            fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            for table in self.tables.values():
+                for pk in sorted(table.rows):
+                    row = table.rows[pk]
+                    fh.write(json.dumps({"table": table.name, "pk": pk,
+                                         "row": [enc_value(v) for v in row]},
+                                        ensure_ascii=False) + "\n")
             fh.flush()
-            os.fsync(fh.fileno())
+            self._sync(fh)
         os.replace(tmp, SNAPSHOT)
         self._truncate_wal()
 
@@ -207,6 +232,8 @@ class Database:
             elif kind == "create_index":
                 table = self.tables[op["table"]]
                 table.indexes.add(op["col"])
+            elif kind == "drop_table":
+                self.tables.pop(op["name"], None)
             elif kind == "upsert":
                 table = self.tables[op["table"]]
                 table.rows[op["pk"]] = self._decode_row(table, op["row"])
@@ -286,6 +313,7 @@ class Database:
 # SQL parsing
 # --------------------------------------------------------------------------
 TOKEN_RE = re.compile(r"\s*(?:(?P<num>-?\d+\.\d+|-?\d+)|(?P<str>'(?:[^']|'')*')|"
+                      r"(?P<vec>\[[^\[\]]*\])|"
                       r"(?P<id>[A-Za-z_][A-Za-z0-9_]*)|(?P<op><=|>=|<>|!=|=|<|>|\(|\)|,|;|\*))")
 
 
@@ -308,6 +336,8 @@ def tokenize(sql):
             tokens.append(("num", float(text) if "." in text else int(text)))
         elif kind == "id":
             tokens.append(("id", text))
+        elif kind == "vec":
+            tokens.append(("vec", text))
         else:
             tokens.append(("op", text))
         if pos >= len(sql):
@@ -362,6 +392,14 @@ def fast_insert(sql):
                     buf.append(body[i])
                     i += 1
                 values.append("".join(buf))
+            elif ch == "[":
+                start = i
+                while i < n and body[i] != "]":
+                    i += 1
+                if i >= n:
+                    return None
+                i += 1
+                values.append(body[start:i])
             else:
                 start = i
                 while i < n and body[i] not in ",)":
@@ -417,6 +455,14 @@ class Parser:
 
     # -------- statements --------
     def parse(self):
+        stmt = self._parse_one()
+        while self.accept("op", ";"):
+            pass
+        if self.peek()[0] is not None:
+            raise SQLError("unsupported", f"unsupported syntax near {self.peek()[1]!r}")
+        return stmt
+
+    def _parse_one(self):
         k, v = self.peek()
         if k != "id":
             raise SQLError("syntax_error", "empty statement")
@@ -431,50 +477,108 @@ class Parser:
             return self.parse_update()
         if word == "delete":
             return self.parse_delete()
+        if word == "drop":
+            return self.parse_drop()
+        if word == "set":
+            return self.parse_set()
+        if word == "start":
+            self.next()
+            self.expect("id", "transaction")
+            return {"kind": "begin"}
+        if word == "end":
+            self.next()
+            self.accept("id", "work")
+            return {"kind": "commit"}
         if word == "begin":
+            self.next()
+            self.accept("id", "work")
             return {"kind": "begin"}
         if word == "commit":
+            self.next()
+            self.accept("id", "work")
             return {"kind": "commit"}
         if word == "rollback":
+            self.next()
+            self.accept("id", "work")
             return {"kind": "rollback"}
         raise SQLError("unsupported", f"unsupported statement {v}")
+
+    def parse_drop(self):
+        self.expect("id", "drop")
+        self.expect("id", "table")
+        if_exists = False
+        if self.accept("id", "if"):
+            self.expect("id", "exists")
+            if_exists = True
+        name = self.ident()
+        self.accept("op", ";")
+        return {"kind": "drop_table", "name": name, "if_exists": if_exists}
+
+    def parse_set(self):
+        self.expect("id", "set")
+        name = self.ident()
+        self.expect("op", "=")
+        value = self.next()[1]
+        self.accept("op", ";")
+        return {"kind": "set", "name": name, "value": value}
 
     def parse_create(self):
         self.expect("id", "create")
         if self.accept("id", "table"):
+            if_not_exists = False
+            if self.accept("id", "if"):
+                self.expect("id", "not")
+                self.expect("id", "exists")
+                if_not_exists = True
             name = self.ident()
             self.expect("op", "(")
             columns = []
             pk_index = None
+            pk_name = None
             while True:
-                col_name = self.ident()
-                kind_tok = self.ident().upper()
-                if kind_tok == "BIGINT":
-                    col = Column(col_name, "BIGINT")
-                elif kind_tok == "VARCHAR":
-                    self.expect("op", "(")
-                    size = int(self.next()[1])
-                    self.expect("op", ")")
-                    col = Column(col_name, "VARCHAR", size)
-                elif kind_tok == "VECTOR":
-                    self.expect("op", "(")
-                    size = int(self.next()[1])
-                    self.expect("op", ")")
-                    col = Column(col_name, "VECTOR", size)
-                else:
-                    raise SQLError("unsupported", f"unsupported type {kind_tok}")
-                columns.append(col)
                 if self.accept("id", "primary"):
                     self.accept("id", "key")
-                    pk_index = len(columns) - 1
+                    self.expect("op", "(")
+                    pk_name = self.ident()
+                    self.expect("op", ")")
+                else:
+                    col_name = self.ident()
+                    kind_tok = self.ident().upper()
+                    if kind_tok in ("BIGINT", "INT", "INTEGER"):
+                        col = Column(col_name, "BIGINT")
+                    elif kind_tok in ("VARCHAR", "CHAR", "TEXT"):
+                        if kind_tok == "VARCHAR":
+                            self.expect("op", "(")
+                            size = int(self.next()[1])
+                            self.expect("op", ")")
+                        else:
+                            size = 65535
+                        col = Column(col_name, "VARCHAR", size)
+                    elif kind_tok == "VECTOR":
+                        self.expect("op", "(")
+                        size = int(self.next()[1])
+                        self.expect("op", ")")
+                        col = Column(col_name, "VECTOR", size)
+                    else:
+                        raise SQLError("unsupported", f"unsupported type {kind_tok}")
+                    columns.append(col)
+                    if self.accept("id", "primary"):
+                        self.accept("id", "key")
+                        pk_name = col_name
                 if self.accept("op", ","):
                     continue
                 break
             self.expect("op", ")")
+            if pk_name is not None:
+                for i, col in enumerate(columns):
+                    if col.name.lower() == pk_name.lower():
+                        pk_index = i
+                        break
             if pk_index is None:
                 raise SQLError("unsupported", "primary key required")
             self.accept("op", ";")
-            return {"kind": "create_table", "name": name, "columns": columns, "pk_index": pk_index}
+            return {"kind": "create_table", "name": name, "columns": columns, "pk_index": pk_index,
+                    "if_not_exists": if_not_exists}
         if self.accept("id", "vector"):
             self.accept("id", "index")
             index_name = self.ident()
@@ -520,7 +624,7 @@ class Parser:
 
     def parse_literal(self):
         k, v = self.next()
-        if k in ("num", "str"):
+        if k in ("num", "str", "vec"):
             return v
         raise SQLError("syntax_error", "expected literal")
 
@@ -559,11 +663,14 @@ class Parser:
                     continue
                 break
         limit = None
+        offset = None
         if self.accept("id", "limit"):
             limit = int(self.next()[1])
+            if self.accept("id", "offset"):
+                offset = int(self.next()[1])
         self.accept("op", ";")
         return {"kind": "select", "table": table, "projections": projections,
-                "where": where, "order": order, "limit": limit}
+                "where": where, "order": order, "limit": limit, "offset": offset}
 
     def parse_expr(self):
         k, v = self.next()
@@ -582,7 +689,7 @@ class Parser:
 
     def parse_vector_literal(self):
         k, v = self.next()
-        if k != "str":
+        if k not in ("str", "vec"):
             raise SQLError("syntax_error", "expected vector literal")
         text = v.strip()
         if not (text.startswith("[") and text.endswith("]")):
@@ -617,6 +724,8 @@ class Parser:
         if k2 == "str":
             pass
         elif k2 == "num":
+            pass
+        elif k2 == "vec":
             pass
         elif k2 == "id":
             raise SQLError("unsupported", "column comparison unsupported")
@@ -764,6 +873,10 @@ class Engine:
             return self.create_table(stmt)
         if kind == "create_index":
             return self.create_index(stmt)
+        if kind == "drop_table":
+            return self.drop_table(stmt)
+        if kind == "set":
+            return {}
         if kind == "insert":
             return self.insert(stmt)
         if kind == "select":
@@ -785,6 +898,8 @@ class Engine:
 
     def create_table(self, stmt):
         if stmt["name"] in self.db.tables or stmt["name"].lower() in self.db.tables:
+            if stmt.get("if_not_exists"):
+                return {}
             raise SQLError("table_exists", "table already exists")
         self.db.commit_ops([{
             "t": "create_table",
@@ -802,6 +917,15 @@ class Engine:
         if table.columns[idx].kind != "VECTOR":
             raise SQLError("type_error", "index must target vector column")
         self.db.commit_ops([{"t": "create_index", "table": table.name, "col": table.columns[idx].name}])
+        return {}
+
+    def drop_table(self, stmt):
+        table = self.db.tables.get(stmt["name"]) or self.db.tables.get(stmt["name"].lower())
+        if table is None:
+            if stmt.get("if_exists"):
+                return {}
+            raise SQLError("table_not_found", f"unknown table {stmt['name']}")
+        self.db.commit_ops([{"t": "drop_table", "name": table.name}])
         return {}
 
     def insert(self, stmt):
@@ -859,7 +983,7 @@ class Engine:
 
     def _fast_topk(self, stmt, table):
         """Vectorised path for `ORDER BY <distance or its alias> LIMIT k`."""
-        if self.db.tx is not None or stmt["limit"] is None:
+        if self.db.tx is not None or stmt["limit"] is None or stmt.get("offset"):
             return None
         if len(table.rows) > 200000:
             # Avoid materialising a second full copy of a large vector set.
@@ -1001,7 +1125,10 @@ class Engine:
             computed.sort(key=keyfn, reverse=desc)
 
         if stmt["limit"] is not None:
-            computed = computed[: stmt["limit"]]
+            start = stmt.get("offset") or 0
+            computed = computed[start: start + stmt["limit"]]
+        elif stmt.get("offset"):
+            computed = computed[stmt["offset"]:]
 
         out_rows = []
         for _pk, values, _row in computed:

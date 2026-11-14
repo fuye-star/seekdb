@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir numpy==2.5.2
+RUN pip install --no-cache-dir numpy==2.5.2 orjson==3.10.7
 
 WORKDIR /app
 COPY minivectordb.py /app/minivectordb.py

@@ -9,12 +9,27 @@
     "synthetic": false,
     "language": "zh-CN",
     "files": [
-      {"path": "minivectordb.py", "role": "单文件数据库实现：JSONL 协议、SQL 解析、存储/WAL、事务、向量 TopK"},
-      {"path": "Dockerfile", "role": "python:3.12-slim + numpy，ENTRYPOINT 直接运行数据库"},
-      {"path": "README.md", "role": "构建、运行、SQL 范围与恢复说明"},
-      {"path": "conversation.json / agent/conversation.json", "role": "本学习材料"}
+      {
+        "path": "minivectordb.py",
+        "role": "单文件数据库实现：JSONL 协议、SQL 解析、存储/WAL、事务、向量 TopK"
+      },
+      {
+        "path": "Dockerfile",
+        "role": "python:3.12-slim + numpy，ENTRYPOINT 直接运行数据库"
+      },
+      {
+        "path": "README.md",
+        "role": "构建、运行、SQL 范围与恢复说明"
+      },
+      {
+        "path": "conversation.json / agent/conversation.json",
+        "role": "本学习材料"
+      }
     ],
-    "outcome": {"gate": "passed", "performance_raw": 1427.815914}
+    "outcome": {
+      "gate": "passed",
+      "performance_raw": 1427.815914
+    }
   },
   "user_prompts": [
     "https://github.com/oceanbase/seekdb这是官方仓库，你把题目下载到我的仓库去",
@@ -45,25 +60,37 @@
       "id": "t4",
       "role": "assistant",
       "content": "用无头 Edge 渲染该语雀文档并抽取正文 428 行：正文只含题目说明，明确写“赛题文件、评测协议、公开测试与基线由组织方另行提供”，43 个链接全是图片/字体/样式，无附件下载。",
-      "tool": {"name": "headless_edge_dump_dom", "output_excerpt": "lines 428; hits for 'stdin' 5; links 43; no .zip/.tar"}
+      "tool": {
+        "name": "headless_edge_dump_dom",
+        "output_excerpt": "lines 428; hits for 'stdin' 5; links 43; no .zip/.tar"
+      }
     },
     {
       "id": "t5",
       "role": "assistant",
       "content": "再次拉取 round2 分支发现组织方更新到 f4d4e26653af，新增 STDIO_PROTOCOL.md、mysqltest/(20 用例)、protocol_check/。按协议实现：启动输出 {\"type\":\"ready\"}，逐行 JSON 请求，execute/shutdown，响应回传 id，错误返回 ok:false+error.code。",
-      "tool": {"name": "github_contents", "output_excerpt": "STDIO_PROTOCOL.md 12241; mysqltest/manifest.json 3893; protocol_check/run.py 5719; cases 40 files"}
+      "tool": {
+        "name": "github_contents",
+        "output_excerpt": "STDIO_PROTOCOL.md 12241; mysqltest/manifest.json 3893; protocol_check/run.py 5719; cases 40 files"
+      }
     },
     {
       "id": "t6",
       "role": "assistant",
       "content": "写入第一版后跑公开用例：19/20 通过，sql_ordering 失败：SELECT id FROM docs ORDER BY value 报 internal_error: list index out of range。原因是排序键引用未投影列，而排序元组只存投影值。",
-      "tool": {"name": "run_public_cases", "output_excerpt": "FAIL sql_ordering: got {'ok': False, 'error': {'code': 'internal_error', 'message': 'list index out of range'}}; 19/20 passed"}
+      "tool": {
+        "name": "run_public_cases",
+        "output_excerpt": "FAIL sql_ordering: got {'ok': False, 'error': {'code': 'internal_error', 'message': 'list index out of range'}}; 19/20 passed"
+      }
     },
     {
       "id": "t7",
       "role": "assistant",
       "content": "修正为排序项保留完整行 (pk, values, row)：按别名排序用 values，按真实列排序用 row[col_idx]；先按主键稳定排序再用稳定排序按键排序，保证并列主键升序。修完 20/20。",
-      "tool": {"name": "run_public_cases", "output_excerpt": "PASS vector_ties_and_filter; 20/20 passed"}
+      "tool": {
+        "name": "run_public_cases",
+        "output_excerpt": "PASS vector_ties_and_filter; 20/20 passed"
+      }
     },
     {
       "id": "t8",
@@ -75,25 +102,37 @@
       "id": "t9",
       "role": "assistant",
       "content": "补齐隐藏用例最可能覆盖的语义：表级 PRIMARY KEY、裸向量字面量、L2_DISTANCE 参数顺序/表名前缀、WHERE 距离谓词、LIMIT a,b 与 OFFSET、DROP TABLE、SET vector_mode、事务语句别名、BIGINT 范围、单向量列、主键类型、空表列名校验、UPDATE 先校验后写入。",
-      "tool": {"name": "run_public_cases", "output_excerpt": "20/20 passed after semantic hardening"}
+      "tool": {
+        "name": "run_public_cases",
+        "output_excerpt": "20/20 passed after semantic hardening"
+      }
     },
     {
       "id": "t10",
       "role": "assistant",
       "content": "发现 Dockerfile 写死 ENV MVDB_DATA=/data，会覆盖判题器为每个用例分配的独立数据目录，导致第二个用例 table exists；改为优先 VECTORDB_DATA_DIR、默认 /data。",
-      "tool": {"name": "protocol_check", "output_excerpt": "before: sql_comparisons FAIL table_exists; after: 20/20 PASS"}
+      "tool": {
+        "name": "protocol_check",
+        "output_excerpt": "before: sql_comparisons FAIL table_exists; after: 20/20 PASS"
+      }
     },
     {
       "id": "t11",
       "role": "assistant",
       "content": "用官方 protocol_check 在 Linux 容器内跑全部公开用例（含 restart 与 ann 模式）：20 个用例全部 PASS。",
-      "tool": {"name": "protocol_check/run.py --command", "output_excerpt": "sql_crud: PASS ... transaction_shutdown_rollback: PASS"}
+      "tool": {
+        "name": "protocol_check/run.py --command",
+        "output_excerpt": "sql_crud: PASS ... transaction_shutdown_rollback: PASS"
+      }
     },
     {
       "id": "t12",
       "role": "assistant",
       "content": "崩溃恢复验证：提交一条后 kill -9，重启仍能查到；事务内插入后 kill -9，重启未提交数据不出现；再次重启仍正常。",
-      "tool": {"name": "crash_test.py", "output_excerpt": "after crash: rows [[1,\"done\"]]; after txn crash: rows [[1,\"done\"]]; ready after second recovery: True"}
+      "tool": {
+        "name": "crash_test.py",
+        "output_excerpt": "after crash: rows [[1,\"done\"]]; after txn crash: rows [[1,\"done\"]]; ready after second recovery: True"
+      }
     },
     {
       "id": "t13",
@@ -105,13 +144,19 @@
       "id": "t14",
       "role": "assistant",
       "content": "性能剖析后改 TopK 快路径：平方距离代替开方排序、argpartition 只排序候选、‖x‖²+‖q‖²-2x·q 的 BLAS matvec、无过滤时跳过滤掩码、等值过滤结果缓存、复用投影距离。",
-      "tool": {"name": "profile2.py", "output_excerpt": "engine_ms 0.52 -> 0.361 -> 0.282; matmul_ms 0.14; mask_ms 0.084"}
+      "tool": {
+        "name": "profile2.py",
+        "output_excerpt": "engine_ms 0.52 -> 0.361 -> 0.282; matmul_ms 0.14; mask_ms 0.084"
+      }
     },
     {
       "id": "t15",
       "role": "assistant",
       "content": "容器内 2 CPU 基准：查询从 3.5s 降到 0.76s；进一步发现多线程 BLAS 在 2 CPU 下退化到 10.31s，固定 OPENBLAS_NUM_THREADS=1 后 0.68s。tmpfs 对照显示写入 CPU 约 2.13s，其余是 Docker Desktop 虚拟磁盘 fsync 成本。",
-      "tool": {"name": "bench.py", "output_excerpt": "{\"write_s\":51.91,\"query_s\":0.76}; threaded 10.31; tmpfs {\"write_s\":2.13,\"query_s\":0.78}"}
+      "tool": {
+        "name": "bench.py",
+        "output_excerpt": "{\"write_s\":51.91,\"query_s\":0.76}; threaded 10.31; tmpfs {\"write_s\":2.13,\"query_s\":0.78}"
+      }
     }
   ],
   "code_artifacts": [
@@ -137,13 +182,62 @@
     }
   ],
   "experiments": [
-    {"id": "e1", "hypothesis": "握手必须精确 {\"type\":\"ready\"} 且要在首条请求前 flush", "action": "官方 protocol_check --handshake-only", "result": "PASS", "output": "handshake: PASS"},
-    {"id": "e2", "hypothesis": "公开用例可由官方检查器全量驱动", "action": "protocol_check 全量运行", "result": "20/20 PASS", "output": "sql_crud: PASS ... transaction_shutdown_rollback: PASS"},
-    {"id": "e3", "hypothesis": "多行 INSERT 重复主键必须整条原子失败", "action": "transaction_failed_insert 用例", "result": "返回 duplicate_key，只看到 1/2/3，重启后 id=1 的修改仍在", "output": "rows [[1],[2],[3]]; restart [[1,\"保留\"],[2,\"二\"],[3,\"三\"]]"},
-    {"id": "e4", "hypothesis": "向量按 float32 存储，16777217 舍入为 16777216", "action": "vector_float32 用例", "result": "两条距离均为 0.0", "output": "rows [[1,0.0],[2,0.0]]"},
-    {"id": "e5", "hypothesis": "已确认提交在 kill -9 后保留，未提交事务不残留", "action": "crash_test.py 两次强杀", "result": "提交行保留、事务行消失、二次恢复正常", "output": "after crash: [[1,\"done\"]]; after txn crash: [[1,\"done\"]]; ready True"},
-    {"id": "e6", "hypothesis": "查询耗时主要来自逐行计算与多线程 BLAS 争用", "action": "改为矩阵化、BLAS 距离、argpartition、过滤缓存", "result": "engine 0.52ms→0.282ms；容器查询 3.5s→0.76s；多线程 BLAS 退化 10.31s，单线程 0.68s", "output": "engine_ms 0.282; query_s 0.68"},
-    {"id": "e7", "hypothesis": "写入慢是 fsync 而非 SQL 解析", "action": "tmpfs 与容器盘对照", "result": "tmpfs 写入 2.13s，容器盘 51.91s，确认 CPU 侧只需约 2 秒", "output": "{\"write_s\":2.13,\"query_s\":0.78} vs {\"write_s\":51.91,\"query_s\":0.76}"}
+    {
+      "id": "e1",
+      "hypothesis": "握手必须精确 {\"type\":\"ready\"} 且要在首条请求前 flush",
+      "action": "官方 protocol_check --handshake-only",
+      "result": "PASS",
+      "output": "handshake: PASS"
+    },
+    {
+      "id": "e2",
+      "hypothesis": "公开用例可由官方检查器全量驱动",
+      "action": "protocol_check 全量运行",
+      "result": "20/20 PASS",
+      "output": "sql_crud: PASS ... transaction_shutdown_rollback: PASS"
+    },
+    {
+      "id": "e3",
+      "hypothesis": "多行 INSERT 重复主键必须整条原子失败",
+      "action": "transaction_failed_insert 用例",
+      "result": "返回 duplicate_key，只看到 1/2/3，重启后 id=1 的修改仍在",
+      "output": "rows [[1],[2],[3]]; restart [[1,\"保留\"],[2,\"二\"],[3,\"三\"]]"
+    },
+    {
+      "id": "e4",
+      "hypothesis": "向量按 float32 存储，16777217 舍入为 16777216",
+      "action": "vector_float32 用例",
+      "result": "两条距离均为 0.0",
+      "output": "rows [[1,0.0],[2,0.0]]"
+    },
+    {
+      "id": "e5",
+      "hypothesis": "已确认提交在 kill -9 后保留，未提交事务不残留",
+      "action": "crash_test.py 两次强杀",
+      "result": "提交行保留、事务行消失、二次恢复正常",
+      "output": "after crash: [[1,\"done\"]]; after txn crash: [[1,\"done\"]]; ready True"
+    },
+    {
+      "id": "e6",
+      "hypothesis": "查询耗时主要来自逐行计算与多线程 BLAS 争用",
+      "action": "改为矩阵化、BLAS 距离、argpartition、过滤缓存",
+      "result": "engine 0.52ms→0.282ms；容器查询 3.5s→0.76s；多线程 BLAS 退化 10.31s，单线程 0.68s",
+      "output": "engine_ms 0.282; query_s 0.68"
+    },
+    {
+      "id": "e7",
+      "hypothesis": "写入慢是 fsync 而非 SQL 解析",
+      "action": "tmpfs 与容器盘对照",
+      "result": "tmpfs 写入 2.13s、容器盘 51.91s，说明磁盘 fsync 是主要成本；进一步发现多行 INSERT 是逐行提交（每行一次 fsync），改为整条语句一条 WAL 记录后，容器写入从 51.91s 降到 1.94s（同盘同 CPU），tmpfs 下 1.69s",
+      "output": "before {\"write_s\":51.91,\"query_s\":0.76}; after {\"write_s\":1.94,\"query_s\":0.53}"
+    },
+    {
+      "id": "e9",
+      "hypothesis": "多行 INSERT 的 100 行被逐行提交，每行一次 fsync，是写性能的最大瓶颈",
+      "action": "把 insert/update/delete 改为整条语句聚合成一条 WAL 记录并只 fsync 一次；用 20 个公开用例与 crash_test 复核原子性与恢复",
+      "result": "容器内写入 51.91s -> 1.94s（约 27 倍），查询 0.76s -> 0.53s；公开用例 20/20 仍通过，kill -9 后已提交数据保留、未提交事务不残留",
+      "output": "{\"write_s\":1.94,\"query_s\":0.53}; sql_crud..transaction_shutdown_rollback: PASS; crash: [[1,\"done\"]]"
+    }
   ],
   "retrospective": [
     "没有题包时只能从仓库与文档确认协议缺失；拿到 STDIO_PROTOCOL.md 后把重点转为逐字段对齐 JSONL 报文，这是本轮最关键的取舍。",

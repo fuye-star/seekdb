@@ -2,6 +2,7 @@
 """MiniVectorDB: single-process vector database speaking the round2 JSONL protocol."""
 
 import base64
+import ctypes
 import json
 import math
 import os
@@ -32,6 +33,31 @@ except ImportError:  # pragma: no cover - fallback when orjson is unavailable
 
     def _json_dumps(obj):
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _load_topk():
+    candidates = ["/app/libtopk.so",
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "libtopk.so")]
+    for path in candidates:
+        try:
+            lib = ctypes.CDLL(path)
+        except OSError:
+            continue
+        try:
+            lib.topk_l2.restype = ctypes.c_int
+            lib.topk_l2.argtypes = [
+                ctypes.c_void_p, ctypes.c_int64, ctypes.c_int, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+            ]
+        except AttributeError:
+            continue
+        return lib
+    return None
+
+
+_TOPK = _load_topk()
+_TOPK_THREADS = int(os.environ.get("MVDB_TOPK_THREADS", "2"))
 
 DATA_DIR = os.environ.get("VECTORDB_DATA_DIR") or os.environ.get("MVDB_DATA") or "/data"
 DATA_DIR = os.path.abspath(DATA_DIR)
@@ -382,6 +408,8 @@ def tokenize(sql):
 INSERT_HEAD = re.compile(
     r"(?is)^\s*insert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s+values\s+(.*?)[;\s]*$"
 )
+ROW_SPLIT = re.compile(r"\)\s*,\s*\(")
+VALUE_RE = re.compile(r"'((?:[^']|'')*)'|\[([^\]]*)\]|([^,]+)")
 
 
 def fast_insert(sql):
@@ -392,68 +420,31 @@ def fast_insert(sql):
     if column_list:
         # Column-list inserts are handled by the full parser below.
         return None
-    columns = None
+    body = body.strip()
+    if not (body.startswith("(") and body.endswith(")")):
+        return None
     rows = []
-    i, n = 0, len(body)
-    while i < n:
-        while i < n and body[i] in " \t\r\n,":
-            i += 1
-        if i >= n:
-            break
-        if body[i] != "(":
-            return None
-        i += 1
+    for chunk in ROW_SPLIT.split(body[1:-1]):
         values = []
-        while i < n:
-            while i < n and body[i] in " \t\r\n":
-                i += 1
-            if i >= n:
-                return None
-            ch = body[i]
-            if ch in "')":
-                return None
-            if ch == "'":
-                buf = []
-                i += 1
-                while i < n:
-                    if body[i] == "'":
-                        if i + 1 < n and body[i + 1] == "'":
-                            buf.append("'")
-                            i += 2
-                            continue
-                        i += 1
-                        break
-                    buf.append(body[i])
-                    i += 1
-                values.append("".join(buf))
-            elif ch == "[":
-                start = i
-                while i < n and body[i] != "]":
-                    i += 1
-                if i >= n:
-                    return None
-                i += 1
-                values.append(body[start:i])
+        for sm, vm, nm in VALUE_RE.findall(chunk):
+            if sm:
+                values.append(sm.replace("''", "'"))
+            elif vm:
+                values.append("[" + vm + "]")
             else:
-                start = i
-                while i < n and body[i] not in ",)":
-                    i += 1
-                token = body[start:i].strip()
+                token = nm.strip()
+                if not token:
+                    continue
+                if "(" in token or ")" in token:
+                    return None
                 try:
                     values.append(float(token) if ("." in token or "e" in token.lower()) else int(token))
                 except ValueError:
                     return None
-            while i < n and body[i] in " \t\r\n":
-                i += 1
-            if i < n and body[i] == ",":
-                i += 1
-                continue
-            if i < n and body[i] == ")":
-                i += 1
-                break
-            return None
         rows.append(values)
-    return {"kind": "insert", "table": table, "rows": rows, "columns": columns}
+    if len(rows) != body.count("("):
+        return None
+    return {"kind": "insert", "table": table, "rows": rows, "columns": None}
 
 
 class Parser:
@@ -1048,9 +1039,36 @@ class Engine:
                 raise SQLError("duplicate_key", "duplicate primary key")
             seen.add(pk)
             prepared.append((pk, row))
-        for pk, row in prepared:
-            self.db._write_row(table.name, pk, row)
+        self._write_rows(table, prepared)
         return {"affected_rows": len(prepared)}
+
+    def _write_rows(self, table, rows):
+        """Persist a whole statement as ONE durable record (single fsync)."""
+        ops = [{"t": "upsert", "table": table.name, "pk": pk,
+                "row": [enc_value(v) for v in row]} for pk, row in rows]
+        if self.db.tx is not None:
+            rowmap = self.db.tx["rows"].setdefault(table.name, {})
+            deleted = self.db.tx["deleted"].setdefault(table.name, set())
+            for pk, row in rows:
+                rowmap[pk] = row
+                deleted.discard(pk)
+            self.db.tx["ops"].extend(ops)
+        else:
+            self.db.commit_ops(ops)
+
+    def _delete_rows(self, table, pks):
+        if not pks:
+            return
+        ops = [{"t": "delete", "table": table.name, "pk": pk} for pk in pks]
+        if self.db.tx is not None:
+            rowmap = self.db.tx["rows"].setdefault(table.name, {})
+            deleted = self.db.tx["deleted"].setdefault(table.name, set())
+            for pk in pks:
+                rowmap.pop(pk, None)
+                deleted.add(pk)
+            self.db.tx["ops"].extend(ops)
+        else:
+            self.db.commit_ops(ops)
 
     def _project(self, table, projections):
         if any(p["kind"] == "star" for p in projections):
@@ -1136,31 +1154,51 @@ class Engine:
                 keep_arr = np.asarray(keep, dtype=np.int64)
             if len(keep_arr) == 0:
                 return {"columns": names, "rows": []}
-        buf = table._d2
-        if buf is None or len(buf) != len(ids):
-            buf = table._d2 = np.empty(len(ids), dtype=np.float32)
-        np.matmul(mat, query, out=buf)
-        buf *= -2.0
-        buf += table.norms() + float(np.dot(query, query))
-        np.maximum(buf, 0.0, out=buf)
-        if keep_arr is None:
-            cand_ids = ids
-            cand_d2 = buf
-        else:
-            cand_ids = ids[keep_arr]
-            cand_d2 = buf[keep_arr]
-        k = min(stmt["limit"], len(cand_ids))
-        if k < len(cand_ids) // 4:
-            part = np.argpartition(cand_d2, k - 1)[:k]
-        else:
-            part = np.arange(len(cand_ids))
-        order_idx = part[np.lexsort((cand_ids[part], cand_d2[part]))][:k]
-        dists = np.sqrt(cand_d2[order_idx])
+        k = min(stmt["limit"], len(ids) if keep_arr is None else len(keep_arr))
+        ordered_pos = None
+        dists = None
+        if _TOPK is not None and k > 0:
+            out_rows_arr = np.empty(k, dtype=np.int64)
+            out_d2 = np.empty(k, dtype=np.float32)
+            nkeep = 0 if keep_arr is None else len(keep_arr)
+            rc = _TOPK.topk_l2(
+                mat.ctypes.data, len(ids), mat.shape[1], query.ctypes.data,
+                ids.ctypes.data,
+                None if keep_arr is None else keep_arr.ctypes.data,
+                nkeep, k,
+                out_rows_arr.ctypes.data, out_d2.ctypes.data, _TOPK_THREADS,
+            )
+            if rc >= 0:
+                ordered_pos = out_rows_arr[:rc]
+                dists = np.sqrt(out_d2[:rc].astype(np.float32))
+        if ordered_pos is None:
+            buf = table._d2
+            if buf is None or len(buf) != len(ids):
+                buf = table._d2 = np.empty(len(ids), dtype=np.float32)
+            np.matmul(mat, query, out=buf)
+            buf *= -2.0
+            buf += table.norms() + float(np.dot(query, query))
+            np.maximum(buf, 0.0, out=buf)
+            if keep_arr is None:
+                cand_pos = np.arange(len(ids), dtype=np.int64)
+                cand_ids = ids
+                cand_d2 = buf
+            else:
+                cand_pos = keep_arr
+                cand_ids = ids[keep_arr]
+                cand_d2 = buf[keep_arr]
+            if k < len(cand_ids) // 4:
+                part = np.argpartition(cand_d2, k - 1)[:k]
+            else:
+                part = np.arange(len(cand_ids))
+            local = part[np.lexsort((cand_ids[part], cand_d2[part]))][:k]
+            ordered_pos = cand_pos[local]
+            dists = np.sqrt(cand_d2[local])
         same_proj = [expr["type"] == "distance" and expr["column"].lower() == dist_expr["column"].lower()
                      and expr["vector"] == dist_expr["vector"] for expr in exprs]
         out_rows = []
-        for pos, idx in enumerate(order_idx):
-            pk = int(cand_ids[idx])
+        for pos, mat_pos in enumerate(ordered_pos):
+            pk = int(ids[int(mat_pos)])
             row = table.rows[pk]
             values = []
             for j, expr in enumerate(exprs):
@@ -1324,16 +1362,14 @@ class Engine:
             for idx, value in assignments:
                 new_row[idx] = self._coerce(table, idx, value)
             pending.append((pk, new_row))
-        for pk, new_row in pending:
-            self.db._write_row(table.name, pk, new_row)
+        self._write_rows(table, pending)
         return {"affected_rows": len(pending)}
 
     def delete(self, stmt):
         table = self.table(stmt["table"])
         rows = self.db.visible_rows(table.name)
         targets = [pk for pk, row in rows.items() if self._matches(table, row, stmt["where"])]
-        for pk in targets:
-            self.db._delete_row(table.name, pk)
+        self._delete_rows(table, targets)
         return {"affected_rows": len(targets)}
 
 

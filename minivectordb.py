@@ -16,6 +16,23 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 
+try:
+    import orjson
+
+    def _json_loads(text):
+        return orjson.loads(text)
+
+    def _json_dumps(obj):
+        return orjson.dumps(obj)
+except ImportError:  # pragma: no cover - fallback when orjson is unavailable
+    orjson = None
+
+    def _json_loads(text):
+        return json.loads(text)
+
+    def _json_dumps(obj):
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
 DATA_DIR = os.environ.get("VECTORDB_DATA_DIR") or os.environ.get("MVDB_DATA") or "/data"
 DATA_DIR = os.path.abspath(DATA_DIR)
 SNAPSHOT = os.path.join(DATA_DIR, "snapshot.json")
@@ -69,6 +86,8 @@ class Table:
         self._mat = None
         self._col_cache = {}
         self._norms = None
+        self._d2 = None
+        self._eq_cache = {}
 
     @property
     def pk_name(self):
@@ -87,6 +106,7 @@ class Table:
         self._dirty = True
         self._col_cache.clear()
         self._norms = None
+        self._eq_cache.clear()
 
     def norms(self):
         if self._norms is None:
@@ -120,6 +140,7 @@ class Table:
         else:
             mat = np.empty((0, self.columns[vec_col].size), dtype=np.float32)
         self._ids, self._mat, self._dirty = ids, mat, False
+        self._d2 = np.empty(len(ids), dtype=np.float32)
         return self._ids, self._mat
 
 
@@ -745,16 +766,13 @@ class Parser:
         inner = text[1:-1].strip()
         if not inner:
             return []
-        out = []
-        for part in inner.split(","):
-            part = part.strip()
-            if not part:
-                raise SQLError("invalid_vector", "empty vector component")
-            try:
-                out.append(float(part))
-            except ValueError:
-                raise SQLError("invalid_vector", f"bad vector component {part!r}")
-        return out
+        try:
+            arr = np.fromstring(inner, sep=",", dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            raise SQLError("invalid_vector", "malformed vector")
+        if arr.size == 0 or not np.all(np.isfinite(arr)) or arr.size != inner.count(",") + 1:
+            raise SQLError("invalid_vector", "malformed vector")
+        return [float(x) for x in arr]
 
     def parse_where(self):
         conds = [self.parse_condition()]
@@ -1084,35 +1102,53 @@ class Engine:
         if len(ids) == 0:
             return {"columns": names, "rows": []}
         where = stmt["where"]
-        simple = True
-        for cond in where or []:
-            if "distance" in cond:
-                simple = False
-                break
-            idx = table.column_index(cond["column"])
-            if idx is None or cond["op"] != "=" or table.columns[idx].kind == "VECTOR":
-                simple = False
-                break
-        if simple:
-            mask = np.ones(len(ids), dtype=bool)
-            for cond in where or []:
+        keep_arr = None
+        if where:
+            simple = True
+            for cond in where:
+                if "distance" in cond:
+                    simple = False
+                    break
                 idx = table.column_index(cond["column"])
-                mask &= table.column_array(idx) == cond["value"]
-            keep_arr = np.nonzero(mask)[0]
+                if idx is None or cond["op"] != "=" or table.columns[idx].kind == "VECTOR":
+                    simple = False
+                    break
+            if simple:
+                if len(where) == 1:
+                    idx = table.column_index(where[0]["column"])
+                    key = (idx, where[0]["value"])
+                    keep_arr = table._eq_cache.get(key)
+                    if keep_arr is None:
+                        keep_arr = np.nonzero(table.column_array(idx) == where[0]["value"])[0]
+                        table._eq_cache[key] = keep_arr
+                else:
+                    mask = np.ones(len(ids), dtype=bool)
+                    for cond in where:
+                        idx = table.column_index(cond["column"])
+                        mask &= table.column_array(idx) == cond["value"]
+                    keep_arr = np.nonzero(mask)[0]
+            else:
+                keep = []
+                for pos in range(len(ids)):
+                    row = table.rows[int(ids[pos])]
+                    if self._matches(table, row, where):
+                        keep.append(pos)
+                keep_arr = np.asarray(keep, dtype=np.int64)
+            if len(keep_arr) == 0:
+                return {"columns": names, "rows": []}
+        buf = table._d2
+        if buf is None or len(buf) != len(ids):
+            buf = table._d2 = np.empty(len(ids), dtype=np.float32)
+        np.matmul(mat, query, out=buf)
+        buf *= -2.0
+        buf += table.norms() + float(np.dot(query, query))
+        np.maximum(buf, 0.0, out=buf)
+        if keep_arr is None:
+            cand_ids = ids
+            cand_d2 = buf
         else:
-            keep = []
-            for pos in range(len(ids)):
-                row = table.rows[int(ids[pos])]
-                if self._matches(table, row, where):
-                    keep.append(pos)
-            keep_arr = np.asarray(keep, dtype=np.int64)
-        if len(keep_arr) == 0:
-            return {"columns": names, "rows": []}
-        diff = None
-        d2 = table.norms() + float(np.dot(query, query)) - 2.0 * (mat @ query)
-        np.maximum(d2, 0.0, out=d2)
-        cand_ids = ids[keep_arr]
-        cand_d2 = d2[keep_arr]
+            cand_ids = ids[keep_arr]
+            cand_d2 = buf[keep_arr]
         k = min(stmt["limit"], len(cand_ids))
         if k < len(cand_ids) // 4:
             part = np.argpartition(cand_d2, k - 1)[:k]
@@ -1120,13 +1156,17 @@ class Engine:
             part = np.arange(len(cand_ids))
         order_idx = part[np.lexsort((cand_ids[part], cand_d2[part]))][:k]
         dists = np.sqrt(cand_d2[order_idx])
+        same_proj = [expr["type"] == "distance" and expr["column"].lower() == dist_expr["column"].lower()
+                     and expr["vector"] == dist_expr["vector"] for expr in exprs]
         out_rows = []
         for pos, idx in enumerate(order_idx):
             pk = int(cand_ids[idx])
             row = table.rows[pk]
             values = []
-            for expr in exprs:
-                if expr["type"] == "distance":
+            for j, expr in enumerate(exprs):
+                if same_proj[j]:
+                    values.append(float(dists[pos]))
+                elif expr["type"] == "distance":
                     vi = table.column_index(expr["column"])
                     qv = self._coerce(table, vi, expr["vector"])
                     values.append(self._distance(row[vi], qv))
@@ -1301,8 +1341,8 @@ class Engine:
 # protocol loop
 # --------------------------------------------------------------------------
 def emit(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    sys.stdout.buffer.write(_json_dumps(obj) + b"\n")
+    sys.stdout.buffer.flush()
 
 
 def main():
@@ -1324,8 +1364,8 @@ def main():
         if not line:
             continue
         try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
+            request = _json_loads(line)
+        except Exception:  # noqa: BLE001
             log("invalid request line", line[:200])
             continue
         try:
